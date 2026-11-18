@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">FaceSwap Cam</string>
+    <string name="title_activity_main">FaceSwap Cam</string>
+    <string name="package_name">com.example.facecam</string>
+    <string name="custom_url_scheme">com.example.facecam</string>
+</resources>

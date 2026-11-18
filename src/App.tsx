@@ -37,6 +37,15 @@ interface LoadedFace extends DemoFaceMeta {
   landmarks: NormalizedLandmark[];
 }
 
+declare global {
+  interface Window {
+    AndroidBridge?: {
+      saveVideoBase64: (base64Data: string, fileName: string, mimeType: string) => boolean;
+      requestCameraAndAudioPermissions?: () => void;
+    };
+  }
+}
+
 const RESOLUTION_MAP: Record<ResolutionPreset, { width: number; height: number }> = {
   '480p': { width: 854, height: 480 },
   '720p': { width: 1280, height: 720 },
@@ -48,6 +57,41 @@ function formatTime(ms: number): string {
   const m = String(Math.floor(sec / 60)).padStart(2, '0');
   const s = String(sec % 60).padStart(2, '0');
   return `${m}:${s}`;
+}
+
+async function createLandmarkerWithFallback(
+  vision: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>,
+  modelUrl: string,
+  runningMode: 'VIDEO' | 'IMAGE',
+): Promise<FaceLandmarker> {
+  try {
+    return await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: modelUrl, delegate: 'GPU' },
+      runningMode,
+      numFaces: 1,
+      outputFaceBlendshapes: runningMode === 'VIDEO',
+    });
+  } catch {
+    return await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: modelUrl, delegate: 'CPU' },
+      runningMode,
+      numFaces: 1,
+      outputFaceBlendshapes: runningMode === 'VIDEO',
+    });
+  }
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = reader.result as string;
+      const commaIdx = result.indexOf(',');
+      resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
 export default function App() {
@@ -80,7 +124,9 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [statusInfo, setStatusInfo] = useState<string | null>(null);
   const [modelReady, setModelReady] = useState(false);
+  const [cameraRetryTick, setCameraRetryTick] = useState(0);
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -91,24 +137,28 @@ export default function App() {
     let active = true;
     async function initMediaPipe() {
       try {
-        const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm',
-        );
-        const modelUrl =
+        let vision;
+        try {
+          vision = await FilesetResolver.forVisionTasks('/mediapipe/wasm');
+        } catch {
+          vision = await FilesetResolver.forVisionTasks(
+            'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm',
+          );
+        }
+
+        const localModel = '/mediapipe/face_landmarker.task';
+        const remoteModel =
           'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
-        const videoLm = await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: modelUrl, delegate: 'GPU' },
-          runningMode: 'VIDEO',
-          numFaces: 1,
-          outputFaceBlendshapes: true,
-        });
-
-        const imgLm = await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: modelUrl, delegate: 'GPU' },
-          runningMode: 'IMAGE',
-          numFaces: 1,
-        });
+        let videoLm: FaceLandmarker;
+        let imgLm: FaceLandmarker;
+        try {
+          videoLm = await createLandmarkerWithFallback(vision, localModel, 'VIDEO');
+          imgLm = await createLandmarkerWithFallback(vision, localModel, 'IMAGE');
+        } catch {
+          videoLm = await createLandmarkerWithFallback(vision, remoteModel, 'VIDEO');
+          imgLm = await createLandmarkerWithFallback(vision, remoteModel, 'IMAGE');
+        }
 
         if (!active) {
           videoLm.close();
@@ -121,7 +171,6 @@ export default function App() {
         const triangles = buildFaceMeshTriangles(FaceLandmarker.FACE_LANDMARKS_TESSELATION);
         rendererRef.current?.setTriangulation(triangles);
 
-        // Pre-detect landmarks for the 6 demo faces
         for (const meta of DEMO_FACES) {
           try {
             const img = await loadImage(meta.src);
@@ -137,13 +186,14 @@ export default function App() {
               }
             }
           } catch {
-            // Skip individual preload errors cleanly
+            // Skip individual preload failures
           }
         }
         setModelReady(true);
-      } catch {
+      } catch (err) {
+        console.error('MediaPipe init failed:', err);
         setStatusError(
-          'Failed to load MediaPipe GPU model • মিডিয়াপাইপ মডেল লোড করা যায়নি',
+          'Failed to load MediaPipe model • মিডিয়াপাইপ মডেল লোড করা যায়নি',
         );
       }
     }
@@ -203,7 +253,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [settings.facingMode, settings.resolution]);
+  }, [settings.facingMode, settings.resolution, cameraRetryTick]);
 
   useEffect(() => {
     let rafId = 0;
@@ -355,34 +405,69 @@ export default function App() {
         : 'video/webm';
 
     const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const fileName = `FaceSwapCam_${Date.now()}.${ext}`;
     const recorder = new MediaRecorder(combined, { mimeType });
+
     recorder.ondataavailable = (ev) => {
       if (ev.data.size > 0) recordedChunksRef.current.push(ev.data);
     };
-    recorder.onstop = () => {
+
+    recorder.onstop = async () => {
       micStream?.getTracks().forEach((t) => t.stop());
       const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-      const file = new File([blob], `FaceSwapCam_${Date.now()}.${ext}`, { type: mimeType });
+
+      if (window.AndroidBridge?.saveVideoBase64) {
+        try {
+          const b64 = await blobToBase64(blob);
+          const saved = window.AndroidBridge.saveVideoBase64(b64, fileName, mimeType);
+          if (saved) {
+            setStatusInfo('Video saved to Movies/FaceSwapCam • ভিডিও গ্যালারিতে সেভ হয়েছে');
+            return;
+          }
+        } catch {
+          // Fall through to browser download
+        }
+      }
+
+      const file = new File([blob], fileName, { type: mimeType });
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
         navigator.share({ files: [file], title: 'FaceSwap Cam' }).catch(() => {});
       }
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = file.name;
+      a.download = fileName;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 5000);
+      setStatusInfo('Video saved • ভিডিও সেভ হয়েছে');
     };
 
     mediaRecorderRef.current = recorder;
     recorder.start(250);
+    setStatusInfo(null);
     setIsRecording(true);
   }
 
   return (
-    <div className="relative w-full h-full bg-[#090B10] overflow-hidden">
-      <video ref={videoRef} playsInline muted className="hidden" />
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full block" />
+    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#090B10', overflow: 'hidden' }}>
+      <video
+        ref={videoRef}
+        playsInline
+        muted
+        style={{
+          position: 'fixed',
+          top: -9999,
+          left: -9999,
+          width: 1,
+          height: 1,
+          opacity: 0,
+          pointerEvents: 'none',
+        }}
+      />
+      <canvas
+        ref={canvasRef}
+        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block' }}
+      />
 
       {/* Top Glass Header */}
       <header
@@ -391,23 +476,24 @@ export default function App() {
           top: 0,
           left: 0,
           right: 0,
-          padding: '16px',
+          padding: 'calc(env(safe-area-inset-top, 12px) + 8px) 14px 12px',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          background: 'linear-gradient(to bottom, rgba(9,11,16,0.85), rgba(9,11,16,0))',
+          gap: 10,
+          background: 'linear-gradient(to bottom, rgba(9,11,16,0.88), rgba(9,11,16,0))',
           zIndex: 20,
         }}
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Sparkles size={18} color="#00E5C3" />
-            <span className="font-display" style={{ fontWeight: 700, fontSize: '16px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '5px', minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
+            <Sparkles size={16} color="#00E5C3" style={{ flexShrink: 0 }} />
+            <span className="font-display" style={{ fontWeight: 700, fontSize: '15px' }}>
               FaceSwap Cam
             </span>
-            <span style={{ fontSize: '12px', color: '#9CA3B8' }}>• ফেসসোয়াপ ক্যাম</span>
+            <span style={{ fontSize: '11px', color: '#9CA3B8' }}>• ফেসসোয়াপ</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
             <span
               style={{
                 display: 'inline-flex',
@@ -419,6 +505,7 @@ export default function App() {
                 background: 'rgba(20, 24, 36, 0.82)',
                 border: `1px solid ${isTracking ? 'rgba(0,229,195,0.45)' : 'rgba(255,255,255,0.12)'}`,
                 color: isTracking ? '#00E5C3' : '#9CA3B8',
+                whiteSpace: 'nowrap',
               }}
             >
               <span
@@ -452,7 +539,7 @@ export default function App() {
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: '8px' }}>
+        <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
           <IconBtn
             label="Flip • ফ্লিপ"
             onClick={() =>
@@ -474,29 +561,62 @@ export default function App() {
         </div>
       </header>
 
-      {/* Error Toast */}
-      {statusError && (
+      {/* Error / Info Toast */}
+      {(statusError || statusInfo) && (
         <div
           style={{
             position: 'absolute',
-            top: 84,
-            left: 16,
-            right: 16,
+            top: 'calc(env(safe-area-inset-top, 12px) + 74px)',
+            left: 14,
+            right: 14,
             zIndex: 30,
-            background: 'rgba(42, 12, 20, 0.94)',
-            border: '1px solid #FF3B5C',
+            background: statusError ? 'rgba(42, 12, 20, 0.94)' : 'rgba(13, 34, 32, 0.94)',
+            border: `1px solid ${statusError ? '#FF3B5C' : '#00E5C3'}`,
             borderRadius: 14,
-            padding: '12px 14px',
+            padding: '10px 14px',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            gap: 12,
+            gap: 10,
           }}
         >
-          <span style={{ fontSize: 13, color: '#FFE4E8' }}>{statusError}</span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1 }}>
+            <span style={{ fontSize: 13, color: statusError ? '#FFE4E8' : '#E6FFF9' }}>
+              {statusError ?? statusInfo}
+            </span>
+            {statusError && statusError.includes('Camera') && (
+              <button
+                onClick={() => {
+                  window.AndroidBridge?.requestCameraAndAudioPermissions?.();
+                  setCameraRetryTick((n) => n + 1);
+                }}
+                style={{
+                  alignSelf: 'flex-start',
+                  background: '#00E5C3',
+                  color: '#090B10',
+                  border: 'none',
+                  borderRadius: 8,
+                  padding: '6px 12px',
+                  fontSize: 12,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                }}
+              >
+                Allow & Retry • অনুমতি দিন ও পুনরায় চেষ্টা করুন
+              </button>
+            )}
+          </div>
           <button
-            onClick={() => setStatusError(null)}
-            style={{ background: 'none', border: 'none', color: '#FF3B5C', cursor: 'pointer' }}
+            onClick={() => {
+              setStatusError(null);
+              setStatusInfo(null);
+            }}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: statusError ? '#FF3B5C' : '#00E5C3',
+              cursor: 'pointer',
+            }}
           >
             <X size={18} />
           </button>
@@ -510,8 +630,8 @@ export default function App() {
           bottom: 0,
           left: 0,
           right: 0,
-          padding: '16px 12px 28px',
-          background: 'linear-gradient(to top, rgba(9,11,16,0.92), rgba(9,11,16,0))',
+          padding: '16px 12px calc(env(safe-area-inset-bottom, 12px) + 20px)',
+          background: 'linear-gradient(to top, rgba(9,11,16,0.94), rgba(9,11,16,0))',
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
@@ -533,7 +653,7 @@ export default function App() {
             onClick={() => handleSelectFace(null)}
             style={{
               minWidth: 68,
-              height: 82,
+              height: 84,
               borderRadius: 16,
               background: 'rgba(20,24,36,0.85)',
               border: selectedFaceId === null ? '2px solid #00E5C3' : '1px solid rgba(255,255,255,0.12)',
@@ -560,7 +680,7 @@ export default function App() {
                 onClick={() => handleSelectFace(face.id)}
                 style={{
                   minWidth: 70,
-                  height: 82,
+                  height: 84,
                   borderRadius: 16,
                   padding: 4,
                   background: active ? 'rgba(0,229,195,0.16)' : 'rgba(20,24,36,0.85)',
@@ -589,7 +709,7 @@ export default function App() {
             onClick={() => fileInputRef.current?.click()}
             style={{
               minWidth: 72,
-              height: 82,
+              height: 84,
               borderRadius: 16,
               background: 'rgba(20,24,36,0.85)',
               border: '1px dashed rgba(0,229,195,0.55)',
@@ -611,7 +731,7 @@ export default function App() {
             ref={fileInputRef}
             type="file"
             accept="image/*"
-            className="hidden"
+            style={{ display: 'none' }}
             onChange={handleUploadFile}
           />
         </div>
