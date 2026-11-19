@@ -8,6 +8,7 @@ import {
   BookOpen,
   Camera,
   CheckCircle2,
+  Film,
   FlipHorizontal,
   ImagePlus,
   RefreshCw,
@@ -17,8 +18,9 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
+import { VideoSwapStudio, type CharacterAsset } from './components/VideoSwapStudio';
 import { DEMO_FACES, type DemoFaceMeta } from './data/demoFaces';
-import { buildFaceMeshTriangles } from './utils/faceMeshTriangulation';
+import { buildFaceMeshTopology } from './utils/faceMeshTriangulation';
 import { FaceWarpGlRenderer } from './utils/faceWarpGl';
 import { LandmarkOneEuroSmoother } from './utils/oneEuroFilter';
 
@@ -32,11 +34,6 @@ interface SettingsState {
   mirrored: boolean;
 }
 
-interface LoadedFace extends DemoFaceMeta {
-  image: HTMLImageElement;
-  landmarks: NormalizedLandmark[];
-}
-
 declare global {
   interface Window {
     AndroidBridge?: {
@@ -46,10 +43,10 @@ declare global {
   }
 }
 
-const RESOLUTION_MAP: Record<ResolutionPreset, { width: number; height: number }> = {
-  '480p': { width: 854, height: 480 },
-  '720p': { width: 1280, height: 720 },
-  '1080p': { width: 1920, height: 1080 },
+const RESOLUTION_MAP: Record<ResolutionPreset, { longSide: number; shortSide: number }> = {
+  '480p': { longSide: 640, shortSide: 480 },
+  '720p': { longSide: 960, shortSide: 720 },
+  '1080p': { longSide: 1280, shortSide: 960 },
 };
 
 function formatTime(ms: number): string {
@@ -97,7 +94,9 @@ function blobToBase64(blob: Blob): Promise<string> {
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const videoInputRef = useRef<HTMLInputElement | null>(null);
 
   const rendererRef = useRef<FaceWarpGlRenderer | null>(null);
   const videoLandmarkerRef = useRef<FaceLandmarker | null>(null);
@@ -108,12 +107,12 @@ export default function App() {
   const recordedChunksRef = useRef<Blob[]>([]);
 
   const [faces, setFaces] = useState<DemoFaceMeta[]>(DEMO_FACES);
-  const loadedFacesRef = useRef<Map<string, LoadedFace>>(new Map());
+  const loadedFacesRef = useRef<Map<string, CharacterAsset>>(new Map());
   const [selectedFaceId, setSelectedFaceId] = useState<string | null>(DEMO_FACES[0].id);
   const [settings, setSettings] = useState<SettingsState>({
     facingMode: 'user',
     smoothing: 0.65,
-    opacity: 0.92,
+    opacity: 0.90,
     resolution: '720p',
     mirrored: true,
   });
@@ -127,11 +126,14 @@ export default function App() {
   const [statusInfo, setStatusInfo] = useState<string | null>(null);
   const [modelReady, setModelReady] = useState(false);
   const [cameraRetryTick, setCameraRetryTick] = useState(0);
+  const [uploadedVideoUrl, setUploadedVideoUrl] = useState<string | null>(null);
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const selectedFaceIdRef = useRef(selectedFaceId);
   selectedFaceIdRef.current = selectedFaceId;
+  const uploadedVideoUrlRef = useRef(uploadedVideoUrl);
+  uploadedVideoUrlRef.current = uploadedVideoUrl;
 
   useEffect(() => {
     let active = true;
@@ -168,8 +170,8 @@ export default function App() {
         videoLandmarkerRef.current = videoLm;
         imageLandmarkerRef.current = imgLm;
 
-        const triangles = buildFaceMeshTriangles(FaceLandmarker.FACE_LANDMARKS_TESSELATION);
-        rendererRef.current?.setTriangulation(triangles);
+        const topology = buildFaceMeshTopology(FaceLandmarker.FACE_LANDMARKS_TESSELATION);
+        rendererRef.current?.setTriangulation(topology.triangles, topology.vertexAlphas);
 
         for (const meta of DEMO_FACES) {
           try {
@@ -182,7 +184,7 @@ export default function App() {
                 landmarks: res.faceLandmarks[0],
               });
               if (selectedFaceIdRef.current === meta.id) {
-                rendererRef.current?.setCharacterFace(img, res.faceLandmarks[0]);
+                rendererRef.current?.setCharacterFace(img, res.faceLandmarks[0], meta.id);
               }
             }
           } catch {
@@ -209,27 +211,34 @@ export default function App() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-    };
-    resize();
-    window.addEventListener('resize', resize);
+    canvas.width = 720;
+    canvas.height = 960;
     rendererRef.current = new FaceWarpGlRenderer(canvas);
-    return () => window.removeEventListener('resize', resize);
+    frameCanvasRef.current = document.createElement('canvas');
   }, []);
 
   useEffect(() => {
+    if (uploadedVideoUrl) {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      return;
+    }
+
     let cancelled = false;
     async function startCamera() {
       streamRef.current?.getTracks().forEach((t) => t.stop());
       const res = RESOLUTION_MAP[settings.resolution];
+      const isPortrait = window.innerHeight >= window.innerWidth;
+      const idealWidth = isPortrait ? res.shortSide : res.longSide;
+      const idealHeight = isPortrait ? res.longSide : res.shortSide;
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: settings.facingMode,
-            width: { ideal: res.width },
-            height: { ideal: res.height },
+            width: { ideal: idealWidth },
+            height: { ideal: idealHeight },
+            aspectRatio: { ideal: isPortrait ? 3 / 4 : 4 / 3 },
+            frameRate: { ideal: 30, max: 60 },
           },
           audio: false,
         });
@@ -253,50 +262,97 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [settings.facingMode, settings.resolution, cameraRetryTick]);
+  }, [settings.facingMode, settings.resolution, cameraRetryTick, uploadedVideoUrl]);
 
   useEffect(() => {
     let rafId = 0;
     let lastVideoTime = -1;
+    let lastMonotonicMs = performance.now();
+    let trackingActive = false;
 
     const tick = () => {
+      if (uploadedVideoUrlRef.current) {
+        rafId = requestAnimationFrame(tick);
+        return;
+      }
+
       const video = videoRef.current;
       const canvas = canvasRef.current;
+      const frameCanvas = frameCanvasRef.current;
       const renderer = rendererRef.current;
       const lm = videoLandmarkerRef.current;
 
-      if (video && canvas && renderer) {
-        let smoothed: Array<{ x: number; y: number; z: number }> | null = null;
-        let jawOpen = 0;
+      if (
+        video &&
+        canvas &&
+        frameCanvas &&
+        renderer &&
+        video.readyState >= 2 &&
+        video.videoWidth > 0 &&
+        video.videoHeight > 0 &&
+        video.currentTime !== lastVideoTime
+      ) {
+        lastVideoTime = video.currentTime;
 
-        if (lm && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-          lastVideoTime = video.currentTime;
-          const nowMs = performance.now();
-          const result = lm.detectForVideo(video, nowMs);
-          if (result.faceLandmarks.length > 0) {
-            setIsTracking(true);
-            smoothed = smootherRef.current.smooth(
-              result.faceLandmarks[0],
-              nowMs,
-              settingsRef.current.smoothing,
-            );
-            const shapes = result.faceBlendshapes?.[0]?.categories;
-            jawOpen = shapes?.find((c) => c.categoryName === 'jawOpen')?.score ?? 0;
-          } else {
-            setIsTracking(false);
-            smootherRef.current.reset();
-          }
+        // Lock canvas resolution directly to natural camera sensor aspect (zero zoom crop)
+        const maxSide = RESOLUTION_MAP[settingsRef.current.resolution].longSide;
+        const scale = Math.min(1, maxSide / Math.max(video.videoWidth, video.videoHeight));
+        const targetW = Math.max(160, Math.round(video.videoWidth * scale));
+        const targetH = Math.max(160, Math.round(video.videoHeight * scale));
+
+        if (canvas.width !== targetW || canvas.height !== targetH) {
+          canvas.width = targetW;
+          canvas.height = targetH;
+        }
+        if (frameCanvas.width !== targetW || frameCanvas.height !== targetH) {
+          frameCanvas.width = targetW;
+          frameCanvas.height = targetH;
         }
 
-        renderer.renderFrame(
-          video,
-          canvas.width,
-          canvas.height,
-          settingsRef.current.mirrored,
-          smoothed,
-          jawOpen,
-          settingsRef.current.opacity,
-        );
+        // Snapshot exact camera frame BEFORE detection so landmarks & background match 1:1 (0ms drift)
+        const fCtx = frameCanvas.getContext('2d');
+        if (fCtx) {
+          fCtx.drawImage(video, 0, 0, targetW, targetH);
+
+          const nowMs = Math.max(performance.now(), lastMonotonicMs + 1);
+          lastMonotonicMs = nowMs;
+
+          let frameLandmarks: Array<{ x: number; y: number; z: number }> | null = null;
+          let frameJawOpen = 0;
+
+          if (lm) {
+            const result = lm.detectForVideo(frameCanvas, nowMs);
+            if (result.faceLandmarks.length > 0) {
+              if (!trackingActive) {
+                trackingActive = true;
+                setIsTracking(true);
+              }
+              frameLandmarks = smootherRef.current.smooth(
+                result.faceLandmarks[0],
+                nowMs,
+                settingsRef.current.smoothing,
+              );
+              const shapes = result.faceBlendshapes?.[0]?.categories;
+              frameJawOpen = shapes?.find((c) => c.categoryName === 'jawOpen')?.score ?? 0;
+            } else {
+              if (trackingActive) {
+                trackingActive = false;
+                setIsTracking(false);
+              }
+              smootherRef.current.reset();
+            }
+          }
+
+          renderer.renderFrame(
+            frameCanvas,
+            canvas.width,
+            canvas.height,
+            settingsRef.current.mirrored,
+            frameLandmarks,
+            frameJawOpen,
+            settingsRef.current.opacity,
+          );
+        }
       }
       rafId = requestAnimationFrame(tick);
     };
@@ -325,7 +381,7 @@ export default function App() {
     }
     const loaded = loadedFacesRef.current.get(id);
     if (loaded) {
-      rendererRef.current?.setCharacterFace(loaded.image, loaded.landmarks);
+      rendererRef.current?.setCharacterFace(loaded.image, loaded.landmarks, id);
     }
   }
 
@@ -368,13 +424,29 @@ export default function App() {
         landmarks: res.faceLandmarks[0],
       });
       setFaces((prev) => [...prev, meta]);
-      setSelectedFaceId(id);
-      rendererRef.current?.setCharacterFace(img, res.faceLandmarks[0]);
+      if (!uploadedVideoUrl) {
+        setSelectedFaceId(id);
+        rendererRef.current?.setCharacterFace(img, res.faceLandmarks[0], id);
+      }
       setStatusError(null);
     } catch {
       URL.revokeObjectURL(url);
       setStatusError('Could not read selected image • ছবিটি পড়া যায়নি');
     }
+  }
+
+  function handleUploadRecordedVideo(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    if (uploadedVideoUrl) {
+      URL.revokeObjectURL(uploadedVideoUrl);
+    }
+    const url = URL.createObjectURL(file);
+    setStatusError(null);
+    setStatusInfo(null);
+    setUploadedVideoUrl(url);
   }
 
   async function handleToggleRecord() {
@@ -421,7 +493,7 @@ export default function App() {
           const b64 = await blobToBase64(blob);
           const saved = window.AndroidBridge.saveVideoBase64(b64, fileName, mimeType);
           if (saved) {
-            setStatusInfo('Video saved to Movies/FaceSwapCam • ভিডিও গ্যালারিতে সেভ হয়েছে');
+            setStatusInfo('Video saved to Movies/FaceSwapCam • ভিডিও গ্যালারিতে সেভ হয়েছে');
             return;
           }
         } catch {
@@ -439,7 +511,7 @@ export default function App() {
       a.download = fileName;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 5000);
-      setStatusInfo('Video saved • ভিডিও সেভ হয়েছে');
+      setStatusInfo('Video saved • ভিডিও সেভ হয়েছে');
     };
 
     mediaRecorderRef.current = recorder;
@@ -449,7 +521,7 @@ export default function App() {
   }
 
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#090B10', overflow: 'hidden' }}>
+    <div style={{ position: 'relative', width: '100%', height: '100%', background: '#05070B', overflow: 'hidden' }}>
       <video
         ref={videoRef}
         playsInline
@@ -466,7 +538,22 @@ export default function App() {
       />
       <canvas
         ref={canvasRef}
-        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block' }}
+        style={{
+          position: 'absolute',
+          inset: 0,
+          width: '100%',
+          height: '100%',
+          objectFit: 'contain',
+          display: 'block',
+        }}
+      />
+
+      <input
+        ref={videoInputRef}
+        type="file"
+        accept="video/*"
+        style={{ display: 'none' }}
+        onChange={handleUploadRecordedVideo}
       />
 
       {/* Top Glass Header */}
@@ -569,7 +656,7 @@ export default function App() {
             top: 'calc(env(safe-area-inset-top, 12px) + 74px)',
             left: 14,
             right: 14,
-            zIndex: 30,
+            zIndex: 45,
             background: statusError ? 'rgba(42, 12, 20, 0.94)' : 'rgba(13, 34, 32, 0.94)',
             border: `1px solid ${statusError ? '#FF3B5C' : '#00E5C3'}`,
             borderRadius: 14,
@@ -602,7 +689,7 @@ export default function App() {
                   cursor: 'pointer',
                 }}
               >
-                Allow & Retry • অনুমতি দিন ও পুনরায় চেষ্টা করুন
+                Allow & Retry • অনুমতি দিন ও পুনরায় চেষ্টা করুন
               </button>
             )}
           </div>
@@ -736,33 +823,75 @@ export default function App() {
           />
         </div>
 
-        {/* Record Shutter Button */}
-        <button
-          onClick={handleToggleRecord}
-          aria-label="Record Video"
-          style={{
-            width: 72,
-            height: 72,
-            borderRadius: '50%',
-            border: '3px solid #F8FAFC',
-            background: 'rgba(20,24,36,0.65)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            cursor: 'pointer',
-          }}
-        >
-          <span
+        {/* Action Deck: Upload Video + Record Shutter */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 22 }}>
+          <button
+            onClick={() => videoInputRef.current?.click()}
             style={{
-              width: isRecording ? 28 : 54,
-              height: isRecording ? 28 : 54,
-              borderRadius: isRecording ? 8 : '50%',
-              background: '#FF3B5C',
-              transition: 'all 180ms ease',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 3,
+              padding: '8px 12px',
+              borderRadius: 14,
+              background: 'rgba(20,24,36,0.82)',
+              border: '1px solid rgba(0,229,195,0.35)',
+              color: '#F8FAFC',
+              cursor: 'pointer',
             }}
-          />
-        </button>
+          >
+            <Film size={18} color="#00E5C3" />
+            <span style={{ fontSize: 9, fontWeight: 600 }}>Video • ভিডিও</span>
+          </button>
+
+          <button
+            onClick={handleToggleRecord}
+            aria-label="Record Video"
+            style={{
+              width: 72,
+              height: 72,
+              borderRadius: '50%',
+              border: '3px solid #F8FAFC',
+              background: 'rgba(20,24,36,0.65)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: 'pointer',
+            }}
+          >
+            <span
+              style={{
+                width: isRecording ? 28 : 54,
+                height: isRecording ? 28 : 54,
+                borderRadius: isRecording ? 8 : '50%',
+                background: '#FF3B5C',
+                transition: 'all 180ms ease',
+              }}
+            />
+          </button>
+
+          <div style={{ width: 70 }} />
+        </div>
       </footer>
+
+      {/* Multi-Face Recorded Video Studio Overlay */}
+      {uploadedVideoUrl && (
+        <VideoSwapStudio
+          videoUrl={uploadedVideoUrl}
+          faces={faces}
+          loadedFacesMap={loadedFacesRef.current}
+          imageLandmarker={imageLandmarkerRef.current}
+          opacity={settings.opacity}
+          smoothing={settings.smoothing}
+          onUploadCharacterFace={handleUploadFile}
+          onSavedVideo={(msg) => setStatusInfo(msg)}
+          onError={(msg) => setStatusError(msg)}
+          onClose={() => {
+            URL.revokeObjectURL(uploadedVideoUrl);
+            setUploadedVideoUrl(null);
+          }}
+        />
+      )}
 
       {/* Settings Modal */}
       {showSettings && (
@@ -925,8 +1054,8 @@ function IconBtn({
       aria-label={label}
       title={label}
       style={{
-        minWidth: 44,
-        minHeight: 44,
+        minWidth: 42,
+        minHeight: 42,
         borderRadius: 14,
         background: 'rgba(20, 24, 36, 0.82)',
         border: '1px solid rgba(255,255,255,0.14)',

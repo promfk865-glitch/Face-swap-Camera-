@@ -52,6 +52,32 @@ data class BilingualMessage(
     val bn: String,
 )
 
+data class DetectedVideoPerson(
+    val id: String,
+    val index: Int,
+    val labelEn: String,
+    val labelBn: String,
+    val thumbnail: Bitmap,
+    val anchorX: Float,
+    val anchorY: Float,
+    val faceWidth: Float,
+    val assignedFaceId: String? = null,
+)
+
+data class VideoStudioState(
+    val videoUri: Uri? = null,
+    val durationMs: Long = 0L,
+    val previewPositionMs: Long = 0L,
+    val previewBitmap: Bitmap? = null,
+    val detectedPeople: List<DetectedVideoPerson> = emptyList(),
+    val selectedPersonId: String? = null,
+    val isScanning: Boolean = false,
+    val scanProgress: Int = 0,
+    val isPlayingPreview: Boolean = false,
+    val isExporting: Boolean = false,
+    val exportProgress: Int = 0,
+)
+
 data class FaceSwapUiState(
     val settings: CameraSettings = CameraSettings(),
     val faces: List<CharacterFace> = emptyList(),
@@ -65,4 +91,5 @@ data class FaceSwapUiState(
     val lastSavedVideoUri: Uri? = null,
     val showSettings: Boolean = false,
     val showGuide: Boolean = false,
+    val videoStudio: VideoStudioState = VideoStudioState(),
 )

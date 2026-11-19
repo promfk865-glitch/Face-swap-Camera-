@@ -13,11 +13,14 @@ import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 
+import android.graphics.Color
+
 data class LiveFaceTrackingResult(
     val smoothedXY: FloatArray,
     val landmarkCount: Int,
     val jawOpen: Float,
     val hasFace: Boolean,
+    val liveSkinRgb: FloatArray? = null,
 )
 
 class FaceLandmarkerHelper(
@@ -33,6 +36,15 @@ class FaceLandmarkerHelper(
 
     @Volatile
     private var lastFrameTimestampMs: Long = 0L
+
+    @Volatile
+    private var latestRawXY: FloatArray? = null
+
+    @Volatile
+    private var lastSkinSampleMs: Long = 0L
+
+    @Volatile
+    private var cachedLiveSkinRgb: FloatArray? = null
 
     fun initialize(): Boolean {
         val liveOk = createLiveLandmarker(Delegate.GPU) || createLiveLandmarker(Delegate.CPU)
@@ -138,6 +150,13 @@ class FaceLandmarkerHelper(
 
             val ts = maxOf(SystemClock.uptimeMillis(), lastFrameTimestampMs + 1L)
             lastFrameTimestampMs = ts
+
+            val rawLandmarks = latestRawXY
+            if (rawLandmarks != null && ts - lastSkinSampleMs >= 160L) {
+                lastSkinSampleMs = ts
+                cachedLiveSkinRgb = sampleSkinRgb(uprightBitmap, rawLandmarks)
+            }
+
             val mpImage = BitmapImageBuilder(uprightBitmap).build()
             detector.detectAsync(mpImage, ts)
         } catch (t: Throwable) {
@@ -150,6 +169,8 @@ class FaceLandmarkerHelper(
     private fun handleLiveStreamResult(result: FaceLandmarkerResult) {
         val landmarks = result.faceLandmarks().firstOrNull()
         if (landmarks == null || landmarks.isEmpty()) {
+            latestRawXY = null
+            cachedLiveSkinRgb = null
             smoother.reset()
             onLiveResult(
                 LiveFaceTrackingResult(
@@ -157,6 +178,7 @@ class FaceLandmarkerHelper(
                     landmarkCount = 0,
                     jawOpen = 0f,
                     hasFace = false,
+                    liveSkinRgb = null,
                 ),
             )
             return
@@ -168,6 +190,7 @@ class FaceLandmarkerHelper(
             raw[i * 2] = landmarks[i].x()
             raw[i * 2 + 1] = landmarks[i].y()
         }
+        latestRawXY = raw
 
         val nowMs = SystemClock.uptimeMillis()
         val smoothed = smoother.smooth(raw, count, nowMs, smoothingStrength)
@@ -186,6 +209,7 @@ class FaceLandmarkerHelper(
                 landmarkCount = count,
                 jawOpen = smoothedJaw,
                 hasFace = true,
+                liveSkinRgb = cachedLiveSkinRgb,
             ),
         )
     }
@@ -199,5 +223,33 @@ class FaceLandmarkerHelper(
 
     companion object {
         private const val TAG = "FaceLandmarkerHelper"
+
+        fun sampleSkinRgb(bitmap: Bitmap, uvXY: FloatArray): FloatArray {
+            if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) {
+                return floatArrayOf(0.5f, 0.45f, 0.42f)
+            }
+            var r = 0f
+            var g = 0f
+            var b = 0f
+            var count = 0
+            val maxW = bitmap.width - 1
+            val maxH = bitmap.height - 1
+            for (idx in FaceMeshTriangulation.skinSampleIndices) {
+                if (idx * 2 + 1 >= uvXY.size) continue
+                val px = (uvXY[idx * 2] * maxW).toInt().coerceIn(0, maxW)
+                val py = (uvXY[idx * 2 + 1] * maxH).toInt().coerceIn(0, maxH)
+                val pixel = bitmap.getPixel(px, py)
+                r += Color.red(pixel) / 255f
+                g += Color.green(pixel) / 255f
+                b += Color.blue(pixel) / 255f
+                count++
+            }
+            if (count == 0) return floatArrayOf(0.5f, 0.45f, 0.42f)
+            return floatArrayOf(
+                (r / count).coerceAtLeast(0.08f),
+                (g / count).coerceAtLeast(0.08f),
+                (b / count).coerceAtLeast(0.08f),
+            )
+        }
     }
 }

@@ -48,6 +48,7 @@ import androidx.compose.material.icons.filled.FlipCameraAndroid
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -125,10 +126,24 @@ fun CameraScreen(
         },
     )
 
+    val fallbackVideoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+        onResult = { uri ->
+            uri?.let { viewModel.openVideoForSwap(it) }
+        },
+    )
+
+    val videoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia(),
+        onResult = { uri ->
+            uri?.let { viewModel.openVideoForSwap(it) }
+        },
+    )
+
     val previewView = remember {
         PreviewView(context).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-            scaleType = PreviewView.ScaleType.FILL_CENTER
+            scaleType = PreviewView.ScaleType.FIT_CENTER
         }
     }
 
@@ -422,13 +437,69 @@ fun CameraScreen(
                     }
                 }
 
-                RecordShutterButton(
-                    isRecording = uiState.isRecording,
-                    onClick = {
-                        viewModel.toggleRecording(hasAudioPermission = hasAudioPermission)
-                    },
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(22.dp),
+                ) {
+                    Surface(
+                        onClick = {
+                            runCatching {
+                                videoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly),
+                                )
+                            }.onFailure {
+                                fallbackVideoPicker.launch("video/*")
+                            }
+                        },
+                        color = SurfaceGlass,
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, MintCyan.copy(alpha = 0.4f)),
+                        modifier = Modifier.testTag("video_swap_button"),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.VideoLibrary,
+                                contentDescription = "Video Face Swap • ভিডিও সোয়াপ",
+                                tint = MintCyan,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text(
+                                text = "Video • ভিডিও",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontSize = 9.sp,
+                                color = TextPrimary,
+                            )
+                        }
+                    }
+
+                    RecordShutterButton(
+                        isRecording = uiState.isRecording,
+                        onClick = {
+                            viewModel.toggleRecording(hasAudioPermission = hasAudioPermission)
+                        },
+                    )
+
+                    Spacer(modifier = Modifier.width(68.dp))
+                }
             }
+        }
+
+        if (uiState.videoStudio.videoUri != null) {
+            VideoSwapScreen(
+                studioState = uiState.videoStudio,
+                faces = uiState.faces,
+                onBack = { viewModel.closeVideoStudio() },
+                onSelectPerson = { viewModel.selectVideoPerson(it) },
+                onAssignFaceToSelected = { viewModel.assignFaceToSelectedVideoPerson(it) },
+                onUploadCharacterFace = { viewModel.uploadCustomFace(it) },
+                onTogglePlay = { viewModel.toggleVideoPlayPreview() },
+                onSeek = { viewModel.seekVideoPreview(it) },
+                onExportVideo = { viewModel.exportSwappedVideo() },
+            )
         }
 
         if (uiState.showSettings) {

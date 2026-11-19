@@ -59,13 +59,14 @@ export class OneEuroFilter {
   }
 
   filter(value: number, timestampSec: number): number {
+    const hasPrev = this.lastTime !== null;
     if (this.lastTime !== null && timestampSec > this.lastTime) {
-      this.freq = Math.max(1, 1.0 / (timestampSec - this.lastTime));
+      this.freq = Math.min(120, Math.max(1, 1.0 / (timestampSec - this.lastTime)));
     }
     this.lastTime = timestampSec;
 
     const prev = this.xFilter.lastRaw();
-    const dx = this.lastTime === null ? 0 : (value - prev) * this.freq;
+    const dx = hasPrev ? (value - prev) * this.freq : 0;
     const edx = this.dxFilter.filter(dx, this.alpha(this.dCutoff));
     const cutoff = this.minCutoff + this.beta * Math.abs(edx);
     return this.xFilter.filter(value, this.alpha(cutoff));
@@ -87,9 +88,9 @@ export class LandmarkOneEuroSmoother {
     smoothingStrength: number,
   ): Array<{ x: number; y: number; z: number }> {
     const t = timestampMs / 1000.0;
-    // Higher smoothingStrength => lower minCutoff (less jitter) and gentler beta
-    const minCutoff = 2.6 - smoothingStrength * 2.15; // 2.6 down to 0.45 Hz
-    const beta = 0.08 - smoothingStrength * 0.065;    // 0.08 down to 0.015
+    // Responsive velocity adaptation eliminates trailing/ghost lag on head & mouth turns
+    const minCutoff = 4.2 - smoothingStrength * 2.8; // 4.2 down to 1.4 Hz
+    const beta = 0.65 - smoothingStrength * 0.35;    // 0.65 down to 0.30
 
     if (this.filters.length !== landmarks.length) {
       this.filters = landmarks.map(() => [

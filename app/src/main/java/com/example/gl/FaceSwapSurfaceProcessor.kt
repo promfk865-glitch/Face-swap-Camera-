@@ -19,6 +19,7 @@ import androidx.camera.core.CameraEffect
 import androidx.camera.core.SurfaceOutput
 import androidx.camera.core.SurfaceProcessor
 import androidx.camera.core.SurfaceRequest
+import com.example.vision.FaceLandmarkerHelper
 import com.example.vision.FaceMeshTriangulation
 import com.example.vision.LiveFaceTrackingResult
 import java.nio.ByteBuffer
@@ -69,6 +70,8 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
     private var posBuffer: FloatBuffer? = null
     private var mouthPosBuffer: FloatBuffer? = null
     private var mouthEdgeBuffer: FloatBuffer? = null
+    private var faceAvgRgb = floatArrayOf(0.5f, 0.45f, 0.42f)
+    private val smoothedGain = floatArrayOf(1.0f, 1.0f, 1.0f)
 
     private val quadPosBuffer: FloatBuffer = createFloatBuffer(
         floatArrayOf(
@@ -114,10 +117,15 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, faceTexId)
             GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
             uvBuffer = createFloatBuffer(uvLandmarks)
+            faceAvgRgb = FaceLandmarkerHelper.sampleSkinRgb(bitmap, uvLandmarks)
+            smoothedGain[0] = 1.0f
+            smoothedGain[1] = 1.0f
+            smoothedGain[2] = 1.0f
 
             val vertexCount = uvLandmarks.size / 2
+            val precomputedAlphas = FaceMeshTriangulation.vertexAlphas
             val alphas = FloatArray(vertexCount) { idx ->
-                if (FaceMeshTriangulation.faceOvalSet.contains(idx)) 0f else 1f
+                if (idx < precomputedAlphas.size) precomputedAlphas[idx] else 1f
             }
             alphaBuffer = createFloatBuffer(alphas)
             hasFaceTexture = true
@@ -279,7 +287,13 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
                 if (tracking.jawOpen > 0.06f) {
                     drawMouthInterior(tracking.smoothedXY, tracking.jawOpen, mirrored, opacity)
                 }
-                drawFaceMesh(tracking.smoothedXY, tracking.landmarkCount, mirrored, opacity)
+                drawFaceMesh(
+                    smoothedXY = tracking.smoothedXY,
+                    landmarkCount = tracking.landmarkCount,
+                    mirrored = mirrored,
+                    opacity = opacity,
+                    liveSkinRgb = tracking.liveSkinRgb,
+                )
 
                 GLES20.glDisable(GLES20.GL_BLEND)
             }
@@ -381,11 +395,20 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
         landmarkCount: Int,
         mirrored: Boolean,
         opacity: Float,
+        liveSkinRgb: FloatArray?,
     ) {
         val uvBuf = uvBuffer ?: return
         val alphaBuf = alphaBuffer ?: return
         val idxBuf = triangleIndexBuffer ?: return
         if (uvBuf.capacity() < landmarkCount * 2) return
+
+        if (liveSkinRgb != null && liveSkinRgb.size >= 3) {
+            for (c in 0..2) {
+                val ratio = (liveSkinRgb[c] / faceAvgRgb[c].coerceAtLeast(0.08f)).coerceIn(0.55f, 1.55f)
+                val blended = 1.0f + (ratio - 1.0f) * 0.72f
+                smoothedGain[c] = smoothedGain[c] * 0.7f + blended * 0.3f
+            }
+        }
 
         val ndcPos = FloatArray(landmarkCount * 2)
         for (i in 0 until landmarkCount) {
@@ -402,6 +425,7 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
         val alphaLoc = GLES20.glGetAttribLocation(meshProgram, "aAlpha")
         val texLoc = GLES20.glGetUniformLocation(meshProgram, "uFaceTex")
         val opacityLoc = GLES20.glGetUniformLocation(meshProgram, "uOpacity")
+        val gainLoc = GLES20.glGetUniformLocation(meshProgram, "uColorGain")
 
         GLES20.glEnableVertexAttribArray(posLoc)
         GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 0, posBuffer)
@@ -416,6 +440,7 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, faceTexId)
         GLES20.glUniform1i(texLoc, 1)
         GLES20.glUniform1f(opacityLoc, opacity)
+        GLES20.glUniform3f(gainLoc, smoothedGain[0], smoothedGain[1], smoothedGain[2])
 
         idxBuf.position(0)
         GLES20.glDrawElements(GLES20.GL_TRIANGLES, triangleIndexCount, GLES20.GL_UNSIGNED_SHORT, idxBuf)
@@ -556,11 +581,13 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
             precision mediump float;
             uniform sampler2D uFaceTex;
             uniform float uOpacity;
+            uniform vec3 uColorGain;
             varying vec2 vUv;
             varying float vAlpha;
             void main() {
                 vec4 tex = texture2D(uFaceTex, vUv);
-                gl_FragColor = vec4(tex.rgb, tex.a * vAlpha * uOpacity);
+                vec3 matched = clamp(tex.rgb * uColorGain, 0.0, 1.0);
+                gl_FragColor = vec4(matched, tex.a * vAlpha * uOpacity);
             }
         """
     }

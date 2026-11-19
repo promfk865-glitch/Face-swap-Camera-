@@ -18,7 +18,9 @@ import com.example.model.CharacterFace
 import com.example.model.FaceSource
 import com.example.model.FaceSwapUiState
 import com.example.model.VideoResolution
+import com.example.model.VideoStudioState
 import com.example.vision.FaceLandmarkerHelper
+import com.example.vision.VideoFaceSwapEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -52,10 +54,15 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         faceLandmarkerHelper = faceLandmarkerHelper,
     )
 
+    val videoSwapEngine = VideoFaceSwapEngine(application)
+
     private val _uiState = MutableStateFlow(FaceSwapUiState())
     val uiState: StateFlow<FaceSwapUiState> = _uiState.asStateFlow()
 
     private var timerJob: Job? = null
+    private var videoScanJob: Job? = null
+    private var videoPlayJob: Job? = null
+    private var videoPreviewJob: Job? = null
 
     init {
         observeSettings()
@@ -275,6 +282,192 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(errorMessage = BilingualMessage(en, bn)) }
     }
 
+    fun openVideoForSwap(uri: Uri) {
+        videoScanJob?.cancel()
+        videoPlayJob?.cancel()
+        _uiState.update {
+            it.copy(
+                errorMessage = null,
+                videoStudio = VideoStudioState(
+                    videoUri = uri,
+                    isScanning = true,
+                    scanProgress = 0,
+                ),
+            )
+        }
+        videoScanJob = viewModelScope.launch(Dispatchers.IO) {
+            val (durationMs, people) = videoSwapEngine.scanVideoForPeople(uri) { pct ->
+                _uiState.update { s ->
+                    s.copy(videoStudio = s.videoStudio.copy(scanProgress = pct))
+                }
+            }
+            val firstBmp = videoSwapEngine.renderPreviewBitmap(
+                uri = uri,
+                timeMs = 0L,
+                people = people,
+                facesById = _uiState.value.faces.associateBy { it.id },
+                opacity = _uiState.value.settings.blendOpacity,
+            )
+            _uiState.update { state ->
+                state.copy(
+                    errorMessage = if (people.isEmpty()) {
+                        BilingualMessage(
+                            "No faces detected in this video.",
+                            "এই ভিডিওতে কোনো মুখ পাওয়া যায়নি।",
+                        )
+                    } else {
+                        state.errorMessage
+                    },
+                    videoStudio = state.videoStudio.copy(
+                        durationMs = durationMs,
+                        detectedPeople = people,
+                        selectedPersonId = people.firstOrNull()?.id,
+                        previewBitmap = firstBmp,
+                        isScanning = false,
+                        scanProgress = 100,
+                    ),
+                )
+            }
+        }
+    }
+
+    fun selectVideoPerson(personId: String) {
+        _uiState.update { s ->
+            s.copy(videoStudio = s.videoStudio.copy(selectedPersonId = personId))
+        }
+    }
+
+    fun assignFaceToSelectedVideoPerson(faceId: String?) {
+        val targetPersonId = _uiState.value.videoStudio.selectedPersonId ?: return
+        _uiState.update { s ->
+            val updated = s.videoStudio.detectedPeople.map { p ->
+                if (p.id == targetPersonId) p.copy(assignedFaceId = faceId) else p
+            }
+            s.copy(videoStudio = s.videoStudio.copy(detectedPeople = updated))
+        }
+        refreshVideoPreviewFrame()
+    }
+
+    fun seekVideoPreview(positionMs: Long) {
+        _uiState.update { s ->
+            s.copy(videoStudio = s.videoStudio.copy(previewPositionMs = positionMs))
+        }
+        refreshVideoPreviewFrame()
+    }
+
+    fun toggleVideoPlayPreview() {
+        val studio = _uiState.value.videoStudio
+        if (studio.isPlayingPreview) {
+            videoPlayJob?.cancel()
+            _uiState.update { s -> s.copy(videoStudio = s.videoStudio.copy(isPlayingPreview = false)) }
+            return
+        }
+        val uri = studio.videoUri ?: return
+        _uiState.update { s -> s.copy(videoStudio = s.videoStudio.copy(isPlayingPreview = true)) }
+        videoPlayJob?.cancel()
+        videoPlayJob = viewModelScope.launch(Dispatchers.IO) {
+            var pos = _uiState.value.videoStudio.previewPositionMs
+            val dur = _uiState.value.videoStudio.durationMs.coerceAtLeast(100L)
+            if (pos >= dur - 120L) pos = 0L
+            while (isActive && _uiState.value.videoStudio.isPlayingPreview) {
+                val curState = _uiState.value
+                val bmp = videoSwapEngine.renderPreviewBitmap(
+                    uri = uri,
+                    timeMs = pos,
+                    people = curState.videoStudio.detectedPeople,
+                    facesById = curState.faces.associateBy { it.id },
+                    opacity = curState.settings.blendOpacity,
+                )
+                _uiState.update { s ->
+                    s.copy(
+                        videoStudio = s.videoStudio.copy(
+                            previewPositionMs = pos,
+                            previewBitmap = bmp ?: s.videoStudio.previewBitmap,
+                        ),
+                    )
+                }
+                pos += 140L
+                if (pos >= dur) {
+                    _uiState.update { s -> s.copy(videoStudio = s.videoStudio.copy(isPlayingPreview = false, previewPositionMs = 0L)) }
+                    break
+                }
+                delay(120L)
+            }
+        }
+    }
+
+    private fun refreshVideoPreviewFrame() {
+        val studio = _uiState.value.videoStudio
+        val uri = studio.videoUri ?: return
+        videoPreviewJob?.cancel()
+        videoPreviewJob = viewModelScope.launch(Dispatchers.IO) {
+            val state = _uiState.value
+            val bmp = videoSwapEngine.renderPreviewBitmap(
+                uri = uri,
+                timeMs = state.videoStudio.previewPositionMs,
+                people = state.videoStudio.detectedPeople,
+                facesById = state.faces.associateBy { it.id },
+                opacity = state.settings.blendOpacity,
+            )
+            if (bmp != null) {
+                _uiState.update { s ->
+                    s.copy(videoStudio = s.videoStudio.copy(previewBitmap = bmp))
+                }
+            }
+        }
+    }
+
+    fun exportSwappedVideo() {
+        val studio = _uiState.value.videoStudio
+        val uri = studio.videoUri ?: return
+        videoPlayJob?.cancel()
+        _uiState.update { s ->
+            s.copy(
+                videoStudio = s.videoStudio.copy(
+                    isPlayingPreview = false,
+                    isExporting = true,
+                    exportProgress = 0,
+                ),
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val state = _uiState.value
+            val savedUri = videoSwapEngine.exportSwappedVideo(
+                uri = uri,
+                people = state.videoStudio.detectedPeople,
+                facesById = state.faces.associateBy { it.id },
+                opacity = state.settings.blendOpacity,
+                smoothingStrength = state.settings.smoothingStrength,
+                onProgress = { pct ->
+                    _uiState.update { s ->
+                        s.copy(videoStudio = s.videoStudio.copy(exportProgress = pct))
+                    }
+                },
+            )
+            _uiState.update { s ->
+                s.copy(
+                    lastSavedVideoUri = savedUri ?: s.lastSavedVideoUri,
+                    errorMessage = if (savedUri == null) {
+                        BilingualMessage("Failed to save swapped video.", "ভিডিও সেভ করতে সমস্যা হয়েছে।")
+                    } else {
+                        s.errorMessage
+                    },
+                    videoStudio = s.videoStudio.copy(
+                        isExporting = false,
+                        exportProgress = 100,
+                    ),
+                )
+            }
+        }
+    }
+
+    fun closeVideoStudio() {
+        videoScanJob?.cancel()
+        videoPlayJob?.cancel()
+        videoPreviewJob?.cancel()
+        _uiState.update { s -> s.copy(videoStudio = VideoStudioState()) }
+    }
+
     private fun decodeScaledDrawable(
         resources: android.content.res.Resources,
         resId: Int,
@@ -327,8 +520,12 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
     override fun onCleared() {
         super.onCleared()
         timerJob?.cancel()
+        videoScanJob?.cancel()
+        videoPlayJob?.cancel()
+        videoPreviewJob?.cancel()
         cameraEngine.release()
         faceLandmarkerHelper.close()
+        videoSwapEngine.close()
         surfaceProcessor.release()
     }
 }

@@ -81,8 +81,8 @@ class LandmarkOneEuroSmoother {
         smoothingStrength: Float,
     ): FloatArray {
         val tSec = timestampMs / 1000.0
-        val minCutoff = 2.6 - smoothingStrength * 2.15
-        val beta = 0.08 - smoothingStrength * 0.065
+        val minCutoff = 4.2 - smoothingStrength * 2.8
+        val beta = 0.65 - smoothingStrength * 0.35
 
         if (filtersX.size != landmarkCount) {
             filtersX = Array(landmarkCount) { OneEuroFilter(30.0, minCutoff, beta, 1.0) }

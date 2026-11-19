@@ -7,11 +7,14 @@ import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Rational
+import android.view.Surface
 import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.ViewPort
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -65,7 +68,7 @@ class CameraEngine(
                 cameraProvider = provider
 
                 val resolutionSelector = ResolutionSelector.Builder()
-                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                     .build()
 
                 val preview = Preview.Builder()
@@ -110,7 +113,14 @@ class CameraEngine(
                     },
                 )
 
+                val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
+                val viewPort = previewView.viewPort
+                    ?: ViewPort.Builder(Rational(3, 4), rotation)
+                        .setScaleType(ViewPort.FIT)
+                        .build()
+
                 val useCaseGroup = UseCaseGroup.Builder()
+                    .setViewPort(viewPort)
                     .addUseCase(preview)
                     .addUseCase(imageAnalysis)
                     .addUseCase(video)
