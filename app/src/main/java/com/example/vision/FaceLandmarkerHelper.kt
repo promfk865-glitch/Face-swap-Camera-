@@ -46,6 +46,11 @@ class FaceLandmarkerHelper(
     @Volatile
     private var cachedLiveSkinRgb: FloatArray? = null
 
+    private val frameLock = Any()
+    private var latestFrameForRoi: Bitmap? = null
+    private var lastBounds: FloatArray? = null // [cx, cy, w, h]
+    private var lastSeenMs: Long = 0L
+
     fun initialize(): Boolean {
         val liveOk = createLiveLandmarker(Delegate.GPU) || createLiveLandmarker(Delegate.CPU)
         val imageOk = createImageLandmarker(Delegate.GPU) || createImageLandmarker(Delegate.CPU)
@@ -63,9 +68,9 @@ class FaceLandmarkerHelper(
                 .setBaseOptions(baseOptions)
                 .setRunningMode(RunningMode.LIVE_STREAM)
                 .setNumFaces(1)
-                .setMinFaceDetectionConfidence(0.5f)
-                .setMinFacePresenceConfidence(0.5f)
-                .setMinTrackingConfidence(0.5f)
+                .setMinFaceDetectionConfidence(0.2f)
+                .setMinFacePresenceConfidence(0.2f)
+                .setMinTrackingConfidence(0.15f)
                 .setOutputFaceBlendshapes(true)
                 .setResultListener { result, _ -> handleLiveStreamResult(result) }
                 .setErrorListener { err ->
@@ -92,7 +97,9 @@ class FaceLandmarkerHelper(
                 .setBaseOptions(baseOptions)
                 .setRunningMode(RunningMode.IMAGE)
                 .setNumFaces(1)
-                .setMinFaceDetectionConfidence(0.45f)
+                .setMinFaceDetectionConfidence(0.2f)
+                .setMinFacePresenceConfidence(0.2f)
+                .setOutputFaceBlendshapes(true)
                 .build()
 
             imageLandmarker = FaceLandmarker.createFromOptions(context, options)
@@ -148,6 +155,10 @@ class FaceLandmarkerHelper(
                 rawBitmap
             }
 
+            synchronized(frameLock) {
+                latestFrameForRoi = uprightBitmap
+            }
+
             val ts = maxOf(SystemClock.uptimeMillis(), lastFrameTimestampMs + 1L)
             lastFrameTimestampMs = ts
 
@@ -167,40 +178,74 @@ class FaceLandmarkerHelper(
     }
 
     private fun handleLiveStreamResult(result: FaceLandmarkerResult) {
+        val nowMs = SystemClock.uptimeMillis()
         val landmarks = result.faceLandmarks().firstOrNull()
-        if (landmarks == null || landmarks.isEmpty()) {
-            latestRawXY = null
-            cachedLiveSkinRgb = null
-            smoother.reset()
-            onLiveResult(
-                LiveFaceTrackingResult(
-                    smoothedXY = FloatArray(0),
-                    landmarkCount = 0,
-                    jawOpen = 0f,
-                    hasFace = false,
-                    liveSkinRgb = null,
-                ),
-            )
+        if (landmarks != null && landmarks.isNotEmpty()) {
+            val count = landmarks.size
+            val raw = FloatArray(count * 2)
+            for (i in 0 until count) {
+                raw[i * 2] = landmarks[i].x()
+                raw[i * 2 + 1] = landmarks[i].y()
+            }
+            val jawOpen = result.faceBlendshapes()
+                .orElse(emptyList())
+                .firstOrNull()
+                ?.firstOrNull { it.categoryName() == "jawOpen" }
+                ?.score()
+                ?: 0f
+            emitTrackedLandmarks(raw, count, jawOpen, nowMs)
             return
         }
 
-        val count = landmarks.size
-        val raw = FloatArray(count * 2)
-        for (i in 0 until count) {
-            raw[i * 2] = landmarks[i].x()
-            raw[i * 2 + 1] = landmarks[i].y()
+        // ROI Fallback around last known face for steep side turns & backlit frames
+        val roiMatch = tryDetectRoiFallback(nowMs)
+        if (roiMatch != null) {
+            val (raw, jawOpen) = roiMatch
+            emitTrackedLandmarks(raw, raw.size / 2, jawOpen, nowMs)
+            return
         }
+
+        latestRawXY = null
+        cachedLiveSkinRgb = null
+        if (nowMs - lastSeenMs > 300L) {
+            smoother.reset()
+        }
+        onLiveResult(
+            LiveFaceTrackingResult(
+                smoothedXY = FloatArray(0),
+                landmarkCount = 0,
+                jawOpen = 0f,
+                hasFace = false,
+                liveSkinRgb = null,
+            ),
+        )
+    }
+
+    private fun emitTrackedLandmarks(raw: FloatArray, count: Int, rawJaw: Float, nowMs: Long) {
         latestRawXY = raw
+        var minX = 1f
+        var minY = 1f
+        var maxX = 0f
+        var maxY = 0f
+        for (i in 0 until count) {
+            val x = raw[i * 2]
+            val y = raw[i * 2 + 1]
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+        }
+        synchronized(frameLock) {
+            lastBounds = floatArrayOf(
+                (minX + maxX) * 0.5f,
+                (minY + maxY) * 0.5f,
+                (maxX - minX).coerceAtLeast(0.08f),
+                (maxY - minY).coerceAtLeast(0.08f),
+            )
+            lastSeenMs = nowMs
+        }
 
-        val nowMs = SystemClock.uptimeMillis()
         val smoothed = smoother.smooth(raw, count, nowMs, smoothingStrength)
-
-        val rawJaw = result.faceBlendshapes()
-            .orElse(emptyList())
-            .firstOrNull()
-            ?.firstOrNull { it.categoryName() == "jawOpen" }
-            ?.score()
-            ?: 0f
         val smoothedJaw = smoother.smoothJawOpen(rawJaw, nowMs)
 
         onLiveResult(
@@ -212,6 +257,70 @@ class FaceLandmarkerHelper(
                 liveSkinRgb = cachedLiveSkinRgb,
             ),
         )
+    }
+
+    private fun tryDetectRoiFallback(nowMs: Long): Pair<FloatArray, Float>? {
+        val detector = imageLandmarker ?: return null
+        val frame: Bitmap
+        val bounds: FloatArray
+        val seenAt: Long
+        synchronized(frameLock) {
+            frame = latestFrameForRoi ?: return null
+            bounds = lastBounds ?: return null
+            seenAt = lastSeenMs
+        }
+        if (frame.isRecycled || nowMs - seenAt > 2500L) return null
+
+        val boxSize = minOf(0.95f, maxOf(bounds[2], bounds[3]) * 2.15f)
+        val sxNorm = (bounds[0] - boxSize * 0.5f).coerceIn(0f, 1f - boxSize)
+        val syNorm = (bounds[1] - boxSize * 0.5f).coerceIn(0f, 1f - boxSize)
+
+        val sx = (sxNorm * frame.width).toInt().coerceIn(0, frame.width - 1)
+        val sy = (syNorm * frame.height).toInt().coerceIn(0, frame.height - 1)
+        val sw = (boxSize * frame.width).toInt().coerceIn(32, frame.width - sx)
+        val sh = (boxSize * frame.height).toInt().coerceIn(32, frame.height - sy)
+
+        val roiBitmap = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
+        return try {
+            val canvas = android.graphics.Canvas(roiBitmap)
+            val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG).apply {
+                colorFilter = android.graphics.ColorMatrixColorFilter(
+                    android.graphics.ColorMatrix(
+                        floatArrayOf(
+                            1.18f, 0f, 0f, 0f, 8f,
+                            0f, 1.18f, 0f, 0f, 8f,
+                            0f, 0f, 1.18f, 0f, 8f,
+                            0f, 0f, 0f, 1f, 0f,
+                        ),
+                    ),
+                )
+            }
+            canvas.drawBitmap(
+                frame,
+                android.graphics.Rect(sx, sy, sx + sw, sy + sh),
+                android.graphics.Rect(0, 0, 256, 256),
+                paint,
+            )
+
+            val res = detector.detect(BitmapImageBuilder(roiBitmap).build())
+            val lms = res.faceLandmarks().firstOrNull() ?: return null
+            val out = FloatArray(lms.size * 2)
+            for (i in lms.indices) {
+                out[i * 2] = (sxNorm + lms[i].x() * boxSize).coerceIn(0f, 1f)
+                out[i * 2 + 1] = (syNorm + lms[i].y() * boxSize).coerceIn(0f, 1f)
+            }
+            val rawJaw = res.faceBlendshapes()
+                .orElse(emptyList())
+                .firstOrNull()
+                ?.firstOrNull { it.categoryName() == "jawOpen" }
+                ?.score()
+                ?: 0f
+            out to rawJaw
+        } catch (_: Throwable) {
+            null
+        } finally {
+            roiBitmap.recycle()
+        }
     }
 
     fun close() {

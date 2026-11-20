@@ -1,8 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   FaceLandmarker,
-  FilesetResolver,
-  type NormalizedLandmark,
 } from '@mediapipe/tasks-vision';
 import {
   BookOpen,
@@ -21,6 +19,12 @@ import {
 import { VideoSwapStudio, type CharacterAsset } from './components/VideoSwapStudio';
 import { DEMO_FACES, type DemoFaceMeta } from './data/demoFaces';
 import { buildFaceMeshTopology } from './utils/faceMeshTriangulation';
+import {
+  createResilientLandmarker,
+  detectSingleFaceResilient,
+  loadMediaPipeVision,
+  type FaceBounds,
+} from './utils/faceDetectHelper';
 import { FaceWarpGlRenderer } from './utils/faceWarpGl';
 import { LandmarkOneEuroSmoother } from './utils/oneEuroFilter';
 
@@ -56,28 +60,6 @@ function formatTime(ms: number): string {
   return `${m}:${s}`;
 }
 
-async function createLandmarkerWithFallback(
-  vision: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>,
-  modelUrl: string,
-  runningMode: 'VIDEO' | 'IMAGE',
-): Promise<FaceLandmarker> {
-  try {
-    return await FaceLandmarker.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: modelUrl, delegate: 'GPU' },
-      runningMode,
-      numFaces: 1,
-      outputFaceBlendshapes: runningMode === 'VIDEO',
-    });
-  } catch {
-    return await FaceLandmarker.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: modelUrl, delegate: 'CPU' },
-      runningMode,
-      numFaces: 1,
-      outputFaceBlendshapes: runningMode === 'VIDEO',
-    });
-  }
-}
-
 function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -95,6 +77,7 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const detectCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const videoInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -139,28 +122,9 @@ export default function App() {
     let active = true;
     async function initMediaPipe() {
       try {
-        let vision;
-        try {
-          vision = await FilesetResolver.forVisionTasks('/mediapipe/wasm');
-        } catch {
-          vision = await FilesetResolver.forVisionTasks(
-            'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm',
-          );
-        }
-
-        const localModel = '/mediapipe/face_landmarker.task';
-        const remoteModel =
-          'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
-
-        let videoLm: FaceLandmarker;
-        let imgLm: FaceLandmarker;
-        try {
-          videoLm = await createLandmarkerWithFallback(vision, localModel, 'VIDEO');
-          imgLm = await createLandmarkerWithFallback(vision, localModel, 'IMAGE');
-        } catch {
-          videoLm = await createLandmarkerWithFallback(vision, remoteModel, 'VIDEO');
-          imgLm = await createLandmarkerWithFallback(vision, remoteModel, 'IMAGE');
-        }
+        const vision = await loadMediaPipeVision();
+        const videoLm = await createResilientLandmarker(vision, 'VIDEO', 1);
+        const imgLm = await createResilientLandmarker(vision, 'IMAGE', 1);
 
         if (!active) {
           videoLm.close();
@@ -215,6 +179,7 @@ export default function App() {
     canvas.height = 960;
     rendererRef.current = new FaceWarpGlRenderer(canvas);
     frameCanvasRef.current = document.createElement('canvas');
+    detectCanvasRef.current = document.createElement('canvas');
   }, []);
 
   useEffect(() => {
@@ -269,6 +234,10 @@ export default function App() {
     let lastVideoTime = -1;
     let lastMonotonicMs = performance.now();
     let trackingActive = false;
+    let lastBounds: FaceBounds | null = null;
+    let holdLandmarks: Array<{ x: number; y: number; z: number }> | null = null;
+    let holdJawOpen = 0;
+    let holdSeenAtMs = 0;
 
     const tick = () => {
       if (uploadedVideoUrlRef.current) {
@@ -279,6 +248,7 @@ export default function App() {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       const frameCanvas = frameCanvasRef.current;
+      const detectCanvas = detectCanvasRef.current;
       const renderer = rendererRef.current;
       const lm = videoLandmarkerRef.current;
 
@@ -286,6 +256,7 @@ export default function App() {
         video &&
         canvas &&
         frameCanvas &&
+        detectCanvas &&
         renderer &&
         video.readyState >= 2 &&
         video.videoWidth > 0 &&
@@ -319,22 +290,42 @@ export default function App() {
 
           let frameLandmarks: Array<{ x: number; y: number; z: number }> | null = null;
           let frameJawOpen = 0;
+          let frameOpacity = settingsRef.current.opacity;
 
           if (lm) {
-            const result = lm.detectForVideo(frameCanvas, nowMs);
-            if (result.faceLandmarks.length > 0) {
+            const det = detectSingleFaceResilient(
+              lm,
+              imageLandmarkerRef.current,
+              frameCanvas,
+              detectCanvas,
+              lastBounds,
+              nowMs,
+            );
+            lastBounds = det.bounds;
+
+            if (det.landmarks) {
               if (!trackingActive) {
                 trackingActive = true;
                 setIsTracking(true);
               }
               frameLandmarks = smootherRef.current.smooth(
-                result.faceLandmarks[0],
+                det.landmarks,
                 nowMs,
                 settingsRef.current.smoothing,
               );
-              const shapes = result.faceBlendshapes?.[0]?.categories;
+              const shapes = det.blendshapes?.categories;
               frameJawOpen = shapes?.find((c) => c.categoryName === 'jawOpen')?.score ?? 0;
+              holdLandmarks = frameLandmarks;
+              holdJawOpen = frameJawOpen;
+              holdSeenAtMs = nowMs;
+            } else if (holdLandmarks && nowMs - holdSeenAtMs <= 240) {
+              // Brief motion/side-turn dropout: fade gently rather than flickering raw face
+              const fade = 1.0 - (nowMs - holdSeenAtMs) / 240;
+              frameLandmarks = holdLandmarks;
+              frameJawOpen = holdJawOpen;
+              frameOpacity *= fade;
             } else {
+              holdLandmarks = null;
               if (trackingActive) {
                 trackingActive = false;
                 setIsTracking(false);
@@ -350,7 +341,7 @@ export default function App() {
             settingsRef.current.mirrored,
             frameLandmarks,
             frameJawOpen,
-            settingsRef.current.opacity,
+            frameOpacity,
           );
         }
       }

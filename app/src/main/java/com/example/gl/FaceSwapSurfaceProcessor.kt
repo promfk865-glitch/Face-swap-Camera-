@@ -67,6 +67,10 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
     private var triangleIndexCount: Int = 0
     private var uvBuffer: FloatBuffer? = null
     private var alphaBuffer: FloatBuffer? = null
+    private var baseAlphasArray: FloatArray? = null
+    private var dynamicAlphasArray: FloatArray? = null
+    private var lastValidTracking: LiveFaceTrackingResult? = null
+    private var lastFaceUptimeMs: Long = 0L
     private var posBuffer: FloatBuffer? = null
     private var mouthPosBuffer: FloatBuffer? = null
     private var mouthEdgeBuffer: FloatBuffer? = null
@@ -127,6 +131,8 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
             val alphas = FloatArray(vertexCount) { idx ->
                 if (idx < precomputedAlphas.size) precomputedAlphas[idx] else 1f
             }
+            baseAlphasArray = alphas
+            dynamicAlphasArray = FloatArray(vertexCount)
             alphaBuffer = createFloatBuffer(alphas)
             hasFaceTexture = true
         }
@@ -264,6 +270,23 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
         val tracking = latestTracking
         val opacity = blendOpacity
         val mirrored = userMirrored
+        val nowMs = android.os.SystemClock.uptimeMillis()
+
+        var activeTracking: LiveFaceTrackingResult? = null
+        var activeOpacity = opacity
+        if (tracking != null && tracking.hasFace && tracking.landmarkCount > 0) {
+            lastValidTracking = tracking
+            lastFaceUptimeMs = nowMs
+            activeTracking = tracking
+        } else if (lastValidTracking != null) {
+            val elapsed = nowMs - lastFaceUptimeMs
+            if (elapsed <= 240L) {
+                activeTracking = lastValidTracking
+                activeOpacity = opacity * (1f - elapsed / 240f).coerceIn(0f, 1f)
+            } else {
+                lastValidTracking = null
+            }
+        }
 
         for (target in outputTargets) {
             if (!EGL14.eglMakeCurrent(eglDisplay, target.eglSurface, target.eglSurface, eglContext)) {
@@ -280,19 +303,19 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
 
             drawCameraPass(updatedMatrix, flipCameraH)
 
-            if (hasFaceTexture && tracking != null && tracking.hasFace && tracking.landmarkCount > 0) {
+            if (hasFaceTexture && activeTracking != null && activeOpacity > 0.01f) {
                 GLES20.glEnable(GLES20.GL_BLEND)
                 GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
-                if (tracking.jawOpen > 0.06f) {
-                    drawMouthInterior(tracking.smoothedXY, tracking.jawOpen, mirrored, opacity)
+                if (activeTracking.jawOpen > 0.06f) {
+                    drawMouthInterior(activeTracking.smoothedXY, activeTracking.jawOpen, mirrored, activeOpacity)
                 }
                 drawFaceMesh(
-                    smoothedXY = tracking.smoothedXY,
-                    landmarkCount = tracking.landmarkCount,
+                    smoothedXY = activeTracking.smoothedXY,
+                    landmarkCount = activeTracking.landmarkCount,
                     mirrored = mirrored,
-                    opacity = opacity,
-                    liveSkinRgb = tracking.liveSkinRgb,
+                    opacity = activeOpacity,
+                    liveSkinRgb = activeTracking.liveSkinRgb,
                 )
 
                 GLES20.glDisable(GLES20.GL_BLEND)
@@ -419,6 +442,37 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
         }
         posBuffer = updateFloatBuffer(posBuffer, ndcPos)
 
+        // Side-turn occlusion fade so steep 45-80 deg yaw wraps smoothly behind the nose
+        val base = baseAlphasArray
+        if (base != null && base.size >= landmarkCount) {
+            val outAlphas = dynamicAlphasArray?.takeIf { it.size >= landmarkCount }
+                ?: FloatArray(landmarkCount).also { dynamicAlphasArray = it }
+            val noseX = if (landmarkCount > 4) smoothedXY[4 * 2] else 0.5f
+            val leftEdgeX = if (landmarkCount > 234) smoothedXY[234 * 2] else 0.3f
+            val rightEdgeX = if (landmarkCount > 454) smoothedXY[454 * 2] else 0.7f
+            val span = maxOf(0.04f, kotlin.math.abs(rightEdgeX - leftEdgeX))
+            val midX = (leftEdgeX + rightEdgeX) * 0.5f
+            val yaw = (((noseX - midX) / (span * 0.5f)) * 1.4f).coerceIn(-1f, 1f)
+            val absYaw = kotlin.math.abs(yaw)
+            if (absYaw < 0.35f) {
+                System.arraycopy(base, 0, outAlphas, 0, landmarkCount)
+            } else {
+                val sideFadeStrength = ((absYaw - 0.35f) / 0.55f).coerceIn(0f, 1f)
+                for (i in 0 until landmarkCount) {
+                    var a = base[i]
+                    val dxNorm = (smoothedXY[i * 2] - noseX) / (span * 0.5f)
+                    val onHiddenSide = if (yaw < 0f) dxNorm > 0.12f else dxNorm < -0.12f
+                    if (onHiddenSide) {
+                        val edgeFrac = ((kotlin.math.abs(dxNorm) - 0.12f) / 0.55f).coerceIn(0f, 1f)
+                        a *= 1f - sideFadeStrength * edgeFrac * 0.85f
+                    }
+                    outAlphas[i] = a
+                }
+            }
+            alphaBuffer = updateFloatBuffer(alphaBuffer, outAlphas)
+        }
+        val activeAlphaBuf = alphaBuffer ?: alphaBuf
+
         GLES20.glUseProgram(meshProgram)
         val posLoc = GLES20.glGetAttribLocation(meshProgram, "aPos")
         val uvLoc = GLES20.glGetAttribLocation(meshProgram, "aUv")
@@ -434,7 +488,7 @@ class FaceSwapSurfaceProcessor : SurfaceProcessor {
         GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 0, uvBuf)
 
         GLES20.glEnableVertexAttribArray(alphaLoc)
-        GLES20.glVertexAttribPointer(alphaLoc, 1, GLES20.GL_FLOAT, false, 0, alphaBuf)
+        GLES20.glVertexAttribPointer(alphaLoc, 1, GLES20.GL_FLOAT, false, 0, activeAlphaBuf)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, faceTexId)

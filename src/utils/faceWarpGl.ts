@@ -1,3 +1,4 @@
+import { computeSideOcclusionWeights } from './faceDetectHelper';
 import { INNER_LIP_RING, SKIN_SAMPLE_INDICES } from './faceMeshTriangulation';
 
 const CAM_VERTEX = `
@@ -73,8 +74,9 @@ export interface FaceSwapDrawTarget {
   faceKey: string;
   faceImage: HTMLImageElement;
   srcLandmarks: Array<{ x: number; y: number }>;
-  liveLandmarks: Array<{ x: number; y: number }>;
+  liveLandmarks: Array<{ x: number; y: number; z?: number }>;
   jawOpen: number;
+  opacityScale?: number;
 }
 
 interface CachedFaceGl {
@@ -127,6 +129,8 @@ export class FaceWarpGlRenderer {
   private meshIdxBuf: WebGLBuffer;
   private mouthPosBuf: WebGLBuffer;
   private mouthEdgeBuf: WebGLBuffer;
+  private dynamicAlphaBuf: WebGLBuffer;
+  private dynamicAlphas: Float32Array | null = null;
   private triangleCount = 0;
   private defaultVertexAlphas: Float32Array | null = null;
 
@@ -166,6 +170,7 @@ export class FaceWarpGlRenderer {
     this.meshIdxBuf = gl.createBuffer()!;
     this.mouthPosBuf = gl.createBuffer()!;
     this.mouthEdgeBuf = gl.createBuffer()!;
+    this.dynamicAlphaBuf = gl.createBuffer()!;
   }
 
   setTriangulation(indices: Uint16Array, vertexAlphas: Float32Array) {
@@ -266,7 +271,7 @@ export class FaceWarpGlRenderer {
     width: number,
     height: number,
     mirrored: boolean,
-    landmarks: Array<{ x: number; y: number }> | null,
+    landmarks: Array<{ x: number; y: number; z?: number }> | null,
     jawOpen: number,
     opacity: number,
   ) {
@@ -324,7 +329,7 @@ export class FaceWarpGlRenderer {
         faceGl,
         target.liveLandmarks,
         target.jawOpen,
-        opacity,
+        opacity * (target.opacityScale ?? 1.0),
         mirrored,
         ndcScaleX,
         ndcScaleY,
@@ -402,7 +407,7 @@ export class FaceWarpGlRenderer {
     source: TexImageSource,
     personKey: string,
     faceGl: CachedFaceGl,
-    landmarks: Array<{ x: number; y: number }>,
+    landmarks: Array<{ x: number; y: number; z?: number }>,
     jawOpen: number,
     opacity: number,
     mirrored: boolean,
@@ -494,7 +499,21 @@ export class FaceWarpGlRenderer {
     gl.enableVertexAttribArray(uvLoc);
     gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, 0, 0);
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, faceGl.alphaBuf);
+    const baseAlphas = this.defaultVertexAlphas;
+    if (baseAlphas && baseAlphas.length >= landmarks.length) {
+      if (!this.dynamicAlphas || this.dynamicAlphas.length !== landmarks.length) {
+        this.dynamicAlphas = new Float32Array(landmarks.length);
+      }
+      computeSideOcclusionWeights(
+        landmarks as Array<{ x: number; y: number; z: number }>,
+        baseAlphas,
+        this.dynamicAlphas,
+      );
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.dynamicAlphaBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, this.dynamicAlphas, gl.DYNAMIC_DRAW);
+    } else {
+      gl.bindBuffer(gl.ARRAY_BUFFER, faceGl.alphaBuf);
+    }
     const alphaLoc = gl.getAttribLocation(this.meshProg, 'aAlpha');
     gl.enableVertexAttribArray(alphaLoc);
     gl.vertexAttribPointer(alphaLoc, 1, gl.FLOAT, false, 0, 0);

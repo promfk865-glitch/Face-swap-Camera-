@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   FaceLandmarker,
-  FilesetResolver,
   type NormalizedLandmark,
 } from '@mediapipe/tasks-vision';
 import {
@@ -16,13 +15,16 @@ import {
   Users,
 } from 'lucide-react';
 import type { DemoFaceMeta } from '../data/demoFaces';
+import { createResilientLandmarker, loadMediaPipeVision } from '../utils/faceDetectHelper';
 import { buildFaceMeshTopology } from '../utils/faceMeshTriangulation';
 import { FaceWarpGlRenderer, type FaceSwapDrawTarget } from '../utils/faceWarpGl';
 import { LandmarkOneEuroSmoother } from '../utils/oneEuroFilter';
 import {
-  matchFrameFacesToPeople,
+  ProfileHeadTracker,
+  resolveVideoFacesWithTrajectory,
   scanVideoForPeople,
   type DetectedVideoPerson,
+  type VideoTrajectoryKeyframe,
 } from '../utils/videoFaceTracker';
 
 export interface CharacterAsset extends DemoFaceMeta {
@@ -56,65 +58,6 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
-async function createMultiFaceVideoLandmarker(): Promise<FaceLandmarker> {
-  let vision;
-  try {
-    vision = await FilesetResolver.forVisionTasks('/mediapipe/wasm');
-  } catch {
-    vision = await FilesetResolver.forVisionTasks(
-      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm',
-    );
-  }
-  const localModel = '/mediapipe/face_landmarker.task';
-  const remoteModel =
-    'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
-
-  for (const modelUrl of [localModel, remoteModel]) {
-    for (const delegate of ['GPU', 'CPU'] as const) {
-      try {
-        return await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: modelUrl, delegate },
-          runningMode: 'VIDEO',
-          numFaces: 5,
-          outputFaceBlendshapes: true,
-        });
-      } catch {
-        // Try next delegate/model
-      }
-    }
-  }
-  throw new Error('Unable to initialize multi-face video tracker');
-}
-
-async function createMultiFaceImageLandmarker(): Promise<FaceLandmarker> {
-  let vision;
-  try {
-    vision = await FilesetResolver.forVisionTasks('/mediapipe/wasm');
-  } catch {
-    vision = await FilesetResolver.forVisionTasks(
-      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm',
-    );
-  }
-  const localModel = '/mediapipe/face_landmarker.task';
-  const remoteModel =
-    'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
-
-  for (const modelUrl of [localModel, remoteModel]) {
-    for (const delegate of ['GPU', 'CPU'] as const) {
-      try {
-        return await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: modelUrl, delegate },
-          runningMode: 'IMAGE',
-          numFaces: 5,
-        });
-      } catch {
-        // Try next
-      }
-    }
-  }
-  throw new Error('Unable to initialize multi-face image detector');
-}
-
 export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
   videoUrl,
   faces,
@@ -129,6 +72,7 @@ export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const detectCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const uploadCharRef = useRef<HTMLInputElement | null>(null);
   const rendererRef = useRef<FaceWarpGlRenderer | null>(null);
   const videoLmRef = useRef<FaceLandmarker | null>(null);
@@ -136,6 +80,8 @@ export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
 
   const smoothersRef = useRef<Map<string, LandmarkOneEuroSmoother>>(new Map());
   const anchorsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const liveSnapshotsRef = useRef<Map<string, VideoTrajectoryKeyframe>>(new Map());
+  const headTrackerRef = useRef<ProfileHeadTracker>(new ProfileHeadTracker());
   const peopleRef = useRef<DetectedVideoPerson[]>([]);
 
   const [people, setPeople] = useState<DetectedVideoPerson[]>([]);
@@ -206,10 +152,12 @@ export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
         fc.width = renderW;
         fc.height = renderH;
         frameCanvasRef.current = fc;
+        detectCanvasRef.current = document.createElement('canvas');
 
+        const vision = await loadMediaPipeVision();
         const [vLm, iLm] = await Promise.all([
-          createMultiFaceVideoLandmarker(),
-          createMultiFaceImageLandmarker(),
+          createResilientLandmarker(vision, 'VIDEO', 5),
+          createResilientLandmarker(vision, 'IMAGE', 5),
         ]);
         if (cancelled) {
           vLm.close();
@@ -252,28 +200,36 @@ export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
     const video = videoRef.current;
     const canvas = canvasRef.current;
     const fc = frameCanvasRef.current;
+    const detectCanvas = detectCanvasRef.current;
     const renderer = rendererRef.current;
     const vLm = videoLmRef.current;
-    if (!video || !canvas || !fc || !renderer || video.readyState < 2) return;
+    const iLm = imageLmRef.current;
+    if (!video || !canvas || !fc || !detectCanvas || !renderer || video.readyState < 2) return;
 
     const ctx = fc.getContext('2d');
     if (!ctx) return;
     ctx.drawImage(video, 0, 0, fc.width, fc.height);
 
     const targets: FaceSwapDrawTarget[] = [];
-    if (vLm && peopleRef.current.length > 0) {
-      const res = vLm.detectForVideo(fc, monotonicMs);
-      const matched = matchFrameFacesToPeople(
-        res.faceLandmarks,
-        res.faceBlendshapes,
+    const videoTimeMs = Math.round((video.currentTime || 0) * 1000);
+
+    if ((vLm || iLm) && peopleRef.current.length > 0) {
+      const resolved = resolveVideoFacesWithTrajectory(
+        vLm,
+        iLm,
+        fc,
+        detectCanvas,
         peopleRef.current,
         anchorsRef.current,
         smoothersRef.current,
+        liveSnapshotsRef.current,
+        headTrackerRef.current,
+        videoTimeMs,
         monotonicMs,
         smoothingRef.current,
       );
 
-      for (const m of matched) {
+      for (const m of resolved) {
         if (!m.assignedFaceId) continue;
         const asset = loadedFacesMap.get(m.assignedFaceId);
         if (!asset) continue;
@@ -284,6 +240,7 @@ export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
           srcLandmarks: asset.landmarks,
           liveLandmarks: m.smoothedLandmarks,
           jawOpen: m.jawOpen,
+          opacityScale: m.opacityScale,
         });
       }
     }
@@ -342,6 +299,7 @@ export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
       if (video.ended) video.currentTime = 0;
       smoothersRef.current.clear();
       anchorsRef.current.clear();
+      liveSnapshotsRef.current.clear();
       await video.play();
       setIsPlaying(true);
     } else {
@@ -355,6 +313,8 @@ export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
     if (!video || isExporting) return;
     smoothersRef.current.clear();
     anchorsRef.current.clear();
+    liveSnapshotsRef.current.clear();
+    headTrackerRef.current.clear();
     video.currentTime = val;
     setCurrentTimeSec(val);
   };
@@ -371,6 +331,8 @@ export const VideoSwapStudio: React.FC<VideoSwapStudioProps> = ({
     video.currentTime = 0;
     smoothersRef.current.clear();
     anchorsRef.current.clear();
+    liveSnapshotsRef.current.clear();
+    headTrackerRef.current.clear();
 
     await new Promise<void>((r) => {
       const onSeeked = () => {

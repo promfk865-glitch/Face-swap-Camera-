@@ -52,6 +52,16 @@ data class BilingualMessage(
     val bn: String,
 )
 
+data class VideoTrajectoryKeyframe(
+    val timeMs: Long,
+    val cx: Float,
+    val cy: Float,
+    val faceWidth: Float,
+    val yaw: Float,
+    val jawOpen: Float,
+    val xy: FloatArray,
+)
+
 data class DetectedVideoPerson(
     val id: String,
     val index: Int,
@@ -62,6 +72,7 @@ data class DetectedVideoPerson(
     val anchorY: Float,
     val faceWidth: Float,
     val assignedFaceId: String? = null,
+    val trajectory: List<VideoTrajectoryKeyframe> = emptyList(),
 )
 
 data class VideoStudioState(
